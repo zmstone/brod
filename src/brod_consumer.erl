@@ -53,7 +53,7 @@
 %%%_* Macros -------------------------------------------------------------------
 %% how much time to wait before sending next fetch request when we got
 %% no messages in the last one
--define(SLEEP_TIMEOUT, 1000).
+-define(SLEEP_TIMEOUT, 0).
 
 -define(SEND_FETCH_REQUEST, send_fetch_request).
 
