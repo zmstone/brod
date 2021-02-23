@@ -1,5 +1,10 @@
 ![brod](https://github.com/kafka4beam/brod/workflows/brod/badge.svg?branch=master)
 
+# NOTICE
+
+This product includes software developed by
+Klarna AB (https://www.klarna.com)
+
 # Brod - Apache Kafka Client for Erlang/Elixir
 
 Brod is an Erlang implementation of the Apache Kafka protocol, providing support for both producers and consumers.
