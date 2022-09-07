@@ -1,3 +1,5 @@
+* 3.16.5
+  * Treat 'offset = 0' commit record as a special offset.
 * 3.16.4
   * Allow special begin_offset from consumer managed commits.
   * Fix specs for `brod_group_subscriber_v2.get_committed_offset`

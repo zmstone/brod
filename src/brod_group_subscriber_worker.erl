@@ -112,7 +112,7 @@ resolve_committed_offsets(_T, _P, ?undef) ->
   [];
 resolve_committed_offsets(_T, Partition, Offset) when ?IS_SPECIAL_OFFSET(Offset) ->
   [{Partition, Offset}];
-resolve_committed_offsets(_T, Partition, Offset) when is_integer(Offset) andalso Offset >= 0 ->
+resolve_committed_offsets(_T, Partition, Offset) when is_integer(Offset) andalso Offset >s 0 ->
   %% Note: brod_topic_subscriber expects
   %% _acked_ offset rather than _begin_ offset
   %% in `init' callback return. In order to get
