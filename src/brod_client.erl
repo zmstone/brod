@@ -1,5 +1,6 @@
 %%%
 %%%   Copyright (c) 2015-2021 Klarna Bank AB (publ)
+%%%   Copyright (c) 2021-2024 Kafka4beam Contributors
 %%%
 %%%   Licensed under the Apache License, Version 2.0 (the "License");
 %%%   you may not use this file except in compliance with the License.
@@ -30,6 +31,7 @@
         , get_group_coordinator/2
         , get_transactional_coordinator/2
         , get_leader_connection/3
+        , get_leader_connection/4
         , get_metadata/2
         , get_metadata_safe/2
         , get_partitions_count/2
@@ -39,6 +41,7 @@
         , register_producer/3
         , deregister_consumer/3
         , deregister_producer/3
+        , deregister_owner/2
         , start_link/3
         , start_producer/3
         , start_consumer/3
@@ -67,22 +70,28 @@
 -export_type([config/0]).
 
 -include("brod_int.hrl").
+-include_lib("stdlib/include/ms_transform.hrl").
 
 -define(DEFAULT_RECONNECT_COOL_DOWN_SECONDS, 1).
 -define(DEFAULT_GET_METADATA_TIMEOUT_SECONDS, 5).
 
 %% ClientId as ets table name.
 -define(ETS(ClientId), ClientId).
--define(PRODUCER_KEY(Topic, Partition),
-        {producer, Topic, Partition}).
--define(CONSUMER_KEY(Topic, Partition),
-        {consumer, Topic, Partition}).
--define(TOPIC_METADATA_KEY(Topic),
-        {topics, Topic}).
--define(PRODUCER(Topic, Partition, Pid),
-        {?PRODUCER_KEY(Topic, Partition), Pid}).
--define(CONSUMER(Topic, Partition, Pid),
-        {?CONSUMER_KEY(Topic, Partition), Pid}).
+
+%% Producer pids
+-define(PRODUCER_KEY(Topic, Partition), {producer, Topic, Partition}).
+-define(PRODUCER(Topic, Partition, Pid), {?PRODUCER_KEY(Topic, Partition), Pid}).
+
+%% Consumer pids
+-define(CONSUMER_KEY(Topic, Partition), {consumer, Topic, Partition}).
+-define(CONSUMER(Topic, Partition, Pid), {?CONSUMER_KEY(Topic, Partition), Pid}).
+
+%% Consumer connections
+-define(CONN_KEY(Owner), {conn, Owner}).
+-define(CONN(Owner, Pid), {?CONN_KEY(Owner), Pid}).
+
+%% Topic metadata cache.
+-define(TOPIC_METADATA_KEY(Topic), {topics, Topic}).
 
 -define(UNKNOWN_TOPIC_CACHE_EXPIRE_SECONDS, 120).
 
@@ -121,6 +130,7 @@
        , pid :: connection() | dead_conn()
        }).
 -type conn_state() :: #conn{}.
+-type owner() :: term().
 -record(state,
         { client_id            :: client_id()
         , bootstrap_endpoints  :: [endpoint()]
@@ -225,7 +235,15 @@ stop_consumer(Client, TopicName) ->
 -spec get_leader_connection(client(), topic(), partition()) ->
         {ok, pid()} | {error, any()}.
 get_leader_connection(Client, Topic, Partition) ->
-  safe_gen_call(Client, {get_leader_connection, Topic, Partition}, infinity).
+  get_leader_connection(Client, Topic, Partition, _ExclusiveOwner = undefined).
+
+%% @doc Get the connection to Kafka broker which is the leader for given
+%% Topic-Partition exclusively for the owner.
+-spec get_leader_connection(client(), topic(), partition(), owner()) ->
+        {ok, pid()} | {error, any()}.
+get_leader_connection(Client, Topic, Partition, ExclusiveOwner) ->
+  safe_gen_call(Client, {get_leader_connection_exclusive,
+                         ExclusiveOwner, Topic, Partition}, infinity).
 
 %% @doc Get connection to a kafka broker.
 %%
@@ -290,7 +308,6 @@ get_group_coordinator(Client, GroupId) ->
 get_transactional_coordinator(Client, TransactionId) ->
   safe_gen_call(Client, {get_transactional_coordinator, TransactionId}, infinity).
 
-
 %% @doc Register self() as a partition producer.
 %%
 %% The pid is registered in an ETS table, then the callers
@@ -333,6 +350,12 @@ deregister_consumer(Client, Topic, Partition) ->
   Key = ?CONSUMER_KEY(Topic, Partition),
   gen_server:cast(Client, {deregister, Key}).
 
+%% @doc De-register the owner for a connection.
+-spec deregister_owner(client(), owner()) -> ok.
+deregister_owner(Client, Owner) ->
+  Key = ?CONN_KEY(Owner),
+  gen_server:cast(Client, {deregister, Key}).
+
 %%%_* gen_server callbacks =====================================================
 
 %% @private
@@ -361,13 +384,13 @@ handle_info(init, State0) ->
 handle_info({'EXIT', Pid, Reason}, #state{ client_id     = ClientId
                                          , producers_sup = Pid
                                          } = State) ->
-  ?BROD_LOG_ERROR("client ~p producers supervisor down~nReason: ~p",
+  ?BROD_LOG_ERROR("client ~ts producers supervisor down~nReason: ~p",
                   [ClientId, Pid, Reason]),
   {stop, {producers_sup_down, Reason}, State};
 handle_info({'EXIT', Pid, Reason}, #state{ client_id     = ClientId
                                          , consumers_sup = Pid
                                          } = State) ->
-  ?BROD_LOG_ERROR("client ~p consumers supervisor down~nReason: ~p",
+  ?BROD_LOG_ERROR("client ~ts consumers supervisor down~nReason: ~p",
                   [ClientId, Pid, Reason]),
   {stop, {consumers_sup_down, Reason}, State};
 handle_info({'EXIT', Pid, Reason}, State) ->
@@ -385,8 +408,8 @@ handle_call({stop_producer, Topic}, _From, State) ->
 handle_call({stop_consumer, Topic}, _From, State) ->
   ok = brod_consumers_sup:stop_consumer(State#state.consumers_sup, Topic),
   {reply, ok, State};
-handle_call({get_leader_connection, Topic, Partition}, _From, State) ->
-  {Result, NewState} = do_get_leader_connection(State, Topic, Partition),
+handle_call({get_leader_connection, Topic, Partition, ExclusiveOwner}, _From, State) ->
+  {Result, NewState} = do_get_leader_connection(State, Topic, Partition, ExclusiveOwner),
   {reply, Result, NewState};
 handle_call({get_connection, Host, Port}, _From, State) ->
   {Result, NewState} = maybe_connect(State, {Host, Port}),
@@ -433,6 +456,14 @@ handle_cast({register, Key, Pid}, #state{workers_tab = Tab} = State) ->
   {noreply, State};
 handle_cast({deregister, Key}, #state{workers_tab = Tab} = State) ->
   ets:delete(Tab, Key),
+  case Key of
+    ?CONN_KEY(Owner) ->
+      case ets:lookup(Tab, ?CONN_KEY(Owner)) of
+        [] -> ok;
+        [{_, Pid}] -> shutdown_pid(Pid)
+      end;
+    _ -> ok
+  end,
   {noreply, State};
 handle_cast(Cast, State) ->
   ?BROD_LOG_WARNING("~p [~p] ~p got unexpected cast: ~p",
@@ -449,6 +480,7 @@ terminate(Reason, #state{ client_id     = ClientId
                         , payload_conns = PayloadConns
                         , producers_sup = ProducersSup
                         , consumers_sup = ConsumersSup
+                        , workers_tab   =  Ets
                         }) ->
   case brod_utils:is_normal_reason(Reason) of
     true ->
@@ -462,6 +494,8 @@ terminate(Reason, #state{ client_id     = ClientId
   shutdown_pid(ConsumersSup),
   Shutdown = fun(#conn{pid = Pid}) -> shutdown_pid(Pid) end,
   lists:foreach(Shutdown, PayloadConns),
+  Ms = ets:fun2ms(fun({?CONN_KEY(_), Pid}) -> Pid end),
+  lists:foreach(fun shutdown_pid/1, ets:select(Ets, Ms)),
   shutdown_pid(MetaConn).
 
 %%%_* Internal Functions =======================================================
@@ -619,7 +653,7 @@ do_get_metadata(FetchMetdataFor, Topic,
       ok = maybe_cache_unknown_topic_partition(Ets, Topic, TopicMetadataArray),
       {{ok, Metadata}, State};
     {error, Reason} ->
-      ?BROD_LOG_ERROR("~p failed to fetch metadata for topics: ~p\n"
+      ?BROD_LOG_ERROR("~ts failed to fetch metadata for topics: ~p\n"
                       "reason=~p",
                       [ClientId, Topics, Reason]),
       {{error, Reason}, State}
@@ -641,13 +675,44 @@ ensure_metadata_connection(State) ->
 %% must be called after ensure_metadata_connection
 get_metadata_connection(#state{meta_conn = Conn}) -> Conn.
 
-do_get_leader_connection(State0, Topic, Partition) ->
+do_get_leader_connection(State, Topic, Partition, undefined) ->
+  do_get_leader_connection2(State, Topic, Partition, undefined);
+do_get_leader_connection(#state{workers_tab =  Ets} = State, Topic, Partition, ExclusiveOwner) ->
+  case ets:lookup(Ets, ?CONN_KEY(ExclusiveOwner)) of
+    [] ->
+      do_get_leader_connection2(State, Topic, Partition, ExclusiveOwner);
+    [{_, Pid}] ->
+      case is_process_alive(Pid) of
+        true -> {{ok, Pid}, State};
+        false -> do_get_leader_connection2(State, Topic, Partition, ExclusiveOwner)
+      end
+  end.
+
+do_get_leader_connection2(#state{client_id = ClientId,
+                                 workers_tab = Ets
+                                } = State0,
+                          Topic, Partition, ExclusiveOwner) ->
   State = ensure_metadata_connection(State0),
   MetaConn = get_metadata_connection(State),
   Timeout = timeout(State),
   case kpro:discover_partition_leader(MetaConn, Topic, Partition, Timeout) of
-    {ok, Endpoint} -> maybe_connect(State, Endpoint);
-    {error, Reason} -> {{error, Reason}, State}
+    {ok, Endpoint} when ExclusiveOwner =:= undefined ->
+      maybe_connect(State, Endpoint);
+    {ok, {Host, Port} = Endpoint} ->
+      case do_connect(State0, Endpoint) of
+        {ok, Pid} ->
+          ?BROD_LOG_INFO("client ~ts connected to ~s:~p for exclusive owner ~p~n",
+                         [ClientId, Host, Port, ExclusiveOwner]),
+          true = ets:insert(Ets, ?CONN(ExclusiveOwner, Pid)),
+          {{ok, Pid}, State};
+        {error, Reason} ->
+          ?BROD_LOG_ERROR("client ~ts failed to connect to ~s:~p for exclusive owner ~p~n"
+                          "reason:~p",
+                          [ClientId, Host, Port, ExclusiveOwner, Reason]),
+          {{error, Reason}, State}
+      end;
+    {error, Reason} ->
+       {{error, Reason}, State}
   end.
 
 -spec do_get_group_coordinator(state(), group_id()) ->
@@ -728,7 +793,7 @@ maybe_connect(#state{client_id = ClientId} = State,
     true ->
       connect(State, Endpoint);
     false ->
-      ?BROD_LOG_ERROR("~p (re)connect to ~s:~p aborted.\n"
+      ?BROD_LOG_ERROR("~ts (re)connect to ~s:~p aborted.\n"
                       "last failure: ~p",
                       [ClientId, Host, Port, Reason]),
      {{error, Reason}, State}
@@ -742,13 +807,13 @@ connect(#state{ client_id = ClientId
   Conn =
     case do_connect(Endpoint, State) of
       {ok, Pid} ->
-        ?BROD_LOG_INFO("client ~p connected to ~s:~p~n",
+        ?BROD_LOG_INFO("client ~ts connected to ~s:~p~n",
                        [ClientId, Host, Port]),
         #conn{ endpoint = Endpoint
              , pid = Pid
              };
       {error, Reason} ->
-        ?BROD_LOG_ERROR("client ~p failed to connect to ~s:~p~n"
+        ?BROD_LOG_ERROR("client ~ts failed to connect to ~s:~p~n"
                         "reason:~p",
                         [ClientId, Host, Port, Reason]),
         #conn{ endpoint = Endpoint
@@ -778,12 +843,23 @@ handle_connection_down(#state{ payload_conns = Conns
                              } = State, Pid, Reason) ->
   case lists:keytake(Pid, #conn.pid, Conns) of
     {value, #conn{endpoint = {Host, Port}} = Conn, Rest} ->
-      ?BROD_LOG_INFO("client ~p: payload connection down ~s:~p~n"
+      ?BROD_LOG_INFO("client ~ts: payload connection down ~s:~p~n"
                      "reason:~p", [ClientId, Host, Port, Reason]),
       NewConn = Conn#conn{pid = mark_dead(Reason)},
       State#state{payload_conns = [NewConn | Rest]};
     false ->
-      %% stale EXIT message
+      handle_exclusively_owned_connection_down(State, Pid)
+  end.
+
+handle_exclusively_owned_connection_down(State, ConnPid) ->
+  #state{workers_tab = Ets} = State,
+  Ms = ets:fun2ms(fun({?CONN_KEY(Owner), P}) when P =:= ConnPid -> Owner end),
+  case ets:select(Ets, Ms) of
+    [] ->
+      State;
+    [Owner] ->
+      %% no logging here, the owner should log the reason
+      ets:delete(Ets, ?CONN_KEY(Owner)),
       State
   end.
 
